@@ -1,16 +1,5 @@
 name: web3app
 
-configs:
-  proxy_config:
-    content: |
-      providers:
-        web3-rpc-provider:
-          url: "http://provider:3000/endpoints"
-          sources:
-          - ChainList
-      logger:
-        level: info
-
 services:
   # Enable when you need tenant isolation and rate limiting
   # postgres:
@@ -29,25 +18,34 @@ services:
   #   networks: [app-bridge]
 
   # Provides the free web3 rpc
-  provider:
-    image: dodozoo/we3-rpc-provider:v1.0.0
-    networks: [app-bridge]
-    ports: [3000:3000]
+  # provider:
+  #   image: dodozoo/we3-rpc-provider:v1.0.0
+  #   networks: [app-bridge]
+  #   ports: [3000:3000]
 
   proxy:
     build:
       context: .
       dockerfile: Dockerfile
-    configs:
-      - source: proxy_config
-        target: /app/config/default.yaml
-        mode: 0666
-    depends_on:
-      - provider
+    volumes:
+      - ./logs:/app/logs
+      - ./config/default.yaml:/app/config/default.yaml:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      - LOG_LEVEL=debug
+      - LOG_PRETTIER=true
+      - LOG_TIME_FORMAT="2006-01-02 15:04:05.000"
+    user: "1000:1000"
+    # depends_on:
+    #   - provider
       # - postgres
       # - redis
-    links:
-      - provider
+    # links:
+    #   - provider
       # - postgres
       # - redis
     networks: [app-bridge]

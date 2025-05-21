@@ -84,18 +84,26 @@ func (a *Amqp) Connect(ctx context.Context) (err error) {
 
 // 释放资源,建议NewRabbitMQ获取实例后 配合defer使用
 func (a *Amqp) Close() error {
-	if a != nil {
+	if a == nil {
 		return nil
 	}
-	if a.Conn != nil {
-		if err := a.Conn.Close(); err != nil {
-			return err
-		}
-	}
+
+	var err error
 	if a.Channel != nil {
-		if err := a.Channel.Close(); err != nil {
-			return err
+		if closeErr := a.Channel.Close(); closeErr != nil {
+			err = closeErr
 		}
+		a.Channel = nil
 	}
-	return nil
+
+	if a.Conn != nil {
+		if closeErr := a.Conn.Close(); closeErr != nil {
+			if err == nil {
+				err = closeErr
+			}
+		}
+		a.Conn = nil
+	}
+
+	return err
 }

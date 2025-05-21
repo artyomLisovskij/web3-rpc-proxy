@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"slices"
-	"strconv"
 	"time"
 
 	"github.com/DODOEX/web3rpcproxy/internal/common"
@@ -18,17 +16,23 @@ import (
 	"github.com/DODOEX/web3rpcproxy/utils/config"
 	"github.com/DODOEX/web3rpcproxy/utils/helpers"
 	"github.com/allegro/bigcache"
-	"github.com/duke-git/lancet/v2/slice"
 	"github.com/rs/zerolog"
 )
+
+type CacheMethodConfig struct {
+	TTL               time.Duration `json:"ttl"`
+	InvalidateOnBlock bool          `json:"invalidate_on_block"`
+}
 
 type CacheEntry struct {
 	V          any
 	T          int64
+	BlockNum   *string // Block number at which the request was made
 	compressed bool
 }
+
 type agentServiceConfig struct {
-	CacheMethods      map[string]string
+	CacheMethods      map[string]CacheMethodConfig
 	MaxEntryCacheSize int
 	DisableCache      bool
 }
@@ -83,7 +87,7 @@ func NewAgentService(
 	}
 
 	if existExpiryConfig {
-		expiryConfig := map[string]string{}
+		expiryConfig := map[string]CacheMethodConfig{}
 		config.Unmarshal("cache.results.expiry_durations", &expiryConfig)
 		_config.CacheMethods = expiryConfig
 	}
@@ -145,268 +149,523 @@ func NewAgentService(
 }
 
 func (a agentService) Call(ctx context.Context, rc reqctx.Reqctxs, endpoints []*endpoint.Endpoint) ([]byte, error) {
-	// 1. 解析到jsonrpc数组
+	// 1. Parse JSON-RPC array
 	jsonrpcs, isBatchCall, err := rpc.UnmarshalJSONRPCs(*rc.Body())
 	if err != nil {
+		a.logger.Error().Err(err).Str("body", string(*rc.Body())).Msg("Failed to unmarshal JSON-RPC request")
 		return nil, common.BadRequestError(err.Error(), err)
 	}
+
+	// Log incoming request
+	a.logger.Info().
+		Bool("is_batch", isBatchCall).
+		Str("raw_request", string(*rc.Body())).
+		Interface("parsed_requests", jsonrpcs).
+		Msg("Processing JSON-RPC request")
+
 	if len(jsonrpcs) == 0 {
 		if isBatchCall {
-			return rpc.MarshalJSONRPCResults([]rpc.SealedJSONRPCResult{})
+			return json.Marshal([]interface{}{})
 		}
-		return rpc.MarshalJSONRPCResults(rpc.SealedJSONRPCResult{})
+		return json.Marshal(map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      nil,
+			"result":  nil,
+		})
 	}
 
+	// Validate requests
 	for i := range jsonrpcs {
 		if err := a.jrpcSchema.ValidateRequest(jsonrpcs[i].Method(), jsonrpcs[i].Raw()); err != nil {
+			a.logger.Error().
+				Err(err).
+				Str("method", jsonrpcs[i].Method()).
+				Interface("params", jsonrpcs[i].Raw()).
+				Msg("Invalid JSON-RPC request")
 			return nil, common.BadRequestError(err.Error(), err)
 		}
+
+		// Log details of each request
+		a.logger.Info().
+			Str("method", jsonrpcs[i].Method()).
+			Interface("id", jsonrpcs[i].ID()).
+			Interface("params", jsonrpcs[i].Params()).
+			Msg("Validated JSON-RPC request")
 	}
 
-	// 发出实际调用请求
-	dispatch := func(data []rpc.JSONRPCer) (any, error) {
+	// Track which results came from cache
+	cacheHits := make([]bool, len(jsonrpcs))
+
+	// Send request
+	dispatch := func(data []rpc.JSONRPCer) (interface{}, error) {
 		if len(data) == 0 {
 			if isBatchCall {
-				return []rpc.SealedJSONRPCResult{}, nil
+				return []interface{}{}, nil
 			}
-			return rpc.SealedJSONRPCResult{}, nil
+			return map[string]interface{}{
+				"jsonrpc": "2.0",
+				"id":      nil,
+				"result":  nil,
+			}, nil
 		}
 
-		// 批量调用
+		// Execute request
 		results, err := a.call(ctx, rc, endpoints, data)
-
 		if err != nil {
+			a.logger.Error().Err(err).Msg("RPC call failed")
 			return nil, err
 		}
 
-		// - 返回异常结果
-		// - 返回单个调用的结果
-		if !isBatchCall || (len(results) == 1 && results[0].Error != nil) {
-			return results[0], nil
+		// Log results
+		a.logger.Info().
+			Interface("results", results).
+			Msg("Received RPC results")
+
+		// For batch requests, return array of results
+		if isBatchCall {
+			responseArray := make([]interface{}, len(results))
+			for i, result := range results {
+				responseArray[i] = map[string]interface{}{
+					"jsonrpc":    "2.0",
+					"id":         result.ID,
+					"result":     result.Result,
+					"error":      result.Error,
+					"from_cache": cacheHits[i],
+				}
+			}
+			return responseArray, nil
 		}
 
-		// 返回批量调用的结果
-		return results, nil
+		// For single requests, return first result
+		if len(results) > 0 {
+			return map[string]interface{}{
+				"jsonrpc":    "2.0",
+				"id":         results[0].ID,
+				"result":     results[0].Result,
+				"error":      results[0].Error,
+				"from_cache": cacheHits[0],
+			}, nil
+		}
+
+		return map[string]interface{}{
+			"jsonrpc":    "2.0",
+			"id":         nil,
+			"result":     nil,
+			"from_cache": false,
+		}, nil
 	}
 
-	// 处理调用请求
+	// Process request
 	handle := func(_jsonrpcs []rpc.JSONRPCer) ([]byte, error) {
 		results, err := dispatch(_jsonrpcs)
-
 		if err != nil {
 			return nil, err
 		}
 
-		return rpc.MarshalJSONRPCResults(results)
+		return json.Marshal(results)
 	}
 
-	// 2. 如果不使用缓存，则直接调用
-	if a.config.DisableCache || !rc.Options().Caches() {
+	// Check caching
+	chainId := rc.ChainID()
+	appName := "unknown"
+	if rc.App() != nil {
+		appName = rc.App().Name
+	}
+
+	// Check if caching is disabled
+	if a.config.DisableCache {
+		a.logger.Info().
+			Uint64("chain_id", chainId).
+			Str("app", appName).
+			Bool("cache_disabled", a.config.DisableCache).
+			Msg("Cache globally disabled, making direct request")
 		return handle(jsonrpcs)
 	}
 
-	// 3. 从缓存中获取结果
+	// Check caching settings in request
+	if !rc.Options().Caches() {
+		a.logger.Info().
+			Uint64("chain_id", chainId).
+			Str("app", appName).
+			Bool("option_caches", rc.Options().Caches()).
+			Msg("Cache disabled by request options, making direct request")
+		return handle(jsonrpcs)
+	}
+
+	// 3. Use cache
 	var (
-		chainId   = rc.ChainID()
-		mapping   = map[string][]int{}
-		_jsonrpcs = []rpc.JSONRPCer{}
 		results   = make([]rpc.SealedJSONRPCResult, len(jsonrpcs))
+		_jsonrpcs = []rpc.JSONRPCer{}
+		mapping   = map[string][]int{}
 	)
 
-	for i := 0; i < len(jsonrpcs); i++ {
-		var v any
-		// 读 cache
-		if ok, ttl := _WithCache(a.config.CacheMethods, jsonrpcs[i]); ok {
-			key, entry := _CacheKey(chainId, jsonrpcs[i]), &CacheEntry{}
-			err := _GetCache(a.cache, key, entry)
-			if err == nil {
-				if time.UnixMilli(entry.T).Add(ttl).After(time.Now()) {
-					// 解压
-					if entry.compressed {
-						if _v, err := helpers.Decompress(entry.V.([]byte)); err != nil {
-							rc.Logger().Warn().Err(err).Msgf("Failed to compress cache %s", jsonrpcs[i].Method())
-						} else if err = json.Unmarshal(_v, &v); err != nil {
-							rc.Logger().Warn().Err(err).Msgf("Failed to unmarshal cache %s", jsonrpcs[i].Method())
-						}
-					} else {
-						v = entry.V
-					}
-
-					if jsonrpcs[i].Method() == "eth_blockNumber" {
-						endpoint := slices.MaxFunc(endpoints, func(a *endpoint.Endpoint, b *endpoint.Endpoint) int {
-							return int(b.BlockNumber() - a.BlockNumber())
-						})
-						if height := endpoint.BlockNumber(); height > 0 {
-							if v == nil {
-								v = height
-							} else if n, err := strconv.ParseUint(v.(string), 16, 64); err == nil {
-								v = slices.Max([]uint64{height, n})
-							}
-						}
-					}
-				} else {
-					go a.cache.Delete(key)
-				}
-			}
-		}
-
-		appName := "unknown"
-		if rc.App() != nil {
-			appName = rc.App().Name
-		}
-
-		if v != nil {
-			// hit, 组装结果
-			results[i] = jsonrpcs[i].MakeResult(v, nil)
-			utils.TotalCaches.WithLabelValues(fmt.Sprint(chainId), appName, jsonrpcs[i].Method(), "mem").Inc()
-		} else {
-			// miss, 组装新请求
+	// Process requests, look in cache
+	for i := range jsonrpcs {
+		method := jsonrpcs[i].Method()
+		if !a.canCache(method) {
+			a.logger.Info().
+				Uint64("chain_id", chainId).
+				Str("app", appName).
+				Str("method", method).
+				Msg("Method not cacheable, making direct request")
 			_jsonrpcs = append(_jsonrpcs, jsonrpcs[i])
-			utils.TotalCaches.WithLabelValues(fmt.Sprint(chainId), appName, jsonrpcs[i].Method(), "miss").Inc()
+			utils.TotalCaches.WithLabelValues(fmt.Sprint(chainId), appName, method, "skip").Inc()
+			cacheHits[i] = false
+			continue
+		}
 
-			id := fmt.Sprint(jsonrpcs[i].Raw()["id"])
-			if mapping[id] == nil {
-				mapping[id] = []int{}
+		// Try to get from cache
+		key := a.cacheKey(chainId, jsonrpcs[i])
+		if value, err := a.getCache(key, method, nil); err == nil {
+			results[i] = rpc.SealedJSONRPCResult{
+				ID:        jsonrpcs[i].Raw()["id"],
+				Version:   jsonrpcs[i].Version(),
+				Result:    value,
+				FromCache: true,
 			}
-			mapping[id] = append(mapping[id], i)
+			cacheHits[i] = true
+			a.logger.Debug().
+				Str("method", method).
+				Str("key", key).
+				Msg("Cache hit")
+		} else {
+			_jsonrpcs = append(_jsonrpcs, jsonrpcs[i])
+			mapping[jsonrpcs[i].ID()] = append(mapping[jsonrpcs[i].ID()], i)
+			cacheHits[i] = false
+			a.logger.Debug().
+				Err(err).
+				Str("method", method).
+				Str("key", key).
+				Msg("Cache miss")
 		}
 	}
 
-	// 直接返回缓存结果
+	// Return results from cache
 	if len(_jsonrpcs) <= 0 {
+		a.logger.Info().
+			Uint64("chain_id", chainId).
+			Str("app", appName).
+			Msg("All results from cache")
 		if isBatchCall {
-			return rpc.MarshalJSONRPCResults(results)
+			responseArray := make([]interface{}, len(results))
+			for i, result := range results {
+				responseArray[i] = map[string]interface{}{
+					"jsonrpc":    "2.0",
+					"id":         result.ID,
+					"result":     result.Result,
+					"error":      result.Error,
+					"from_cache": cacheHits[i],
+				}
+				// Log each result
+				a.logger.Info().
+					Uint64("chain_id", chainId).
+					Str("app", appName).
+					Str("method", jsonrpcs[i].Method()).
+					Interface("id", result.ID).
+					Bool("from_cache", cacheHits[i]).
+					Msg("Response details")
+			}
+			return json.Marshal(responseArray)
 		} else if len(results) > 0 {
-			return rpc.MarshalJSONRPCResults(results[0])
+			// Log result
+			a.logger.Info().
+				Uint64("chain_id", chainId).
+				Str("app", appName).
+				Str("method", jsonrpcs[0].Method()).
+				Interface("id", results[0].ID).
+				Bool("from_cache", cacheHits[0]).
+				Msg("Response details")
+			return json.Marshal(map[string]interface{}{
+				"jsonrpc":    "2.0",
+				"id":         results[0].ID,
+				"result":     results[0].Result,
+				"error":      results[0].Error,
+				"from_cache": cacheHits[0],
+			})
 		}
 	}
 
-	// 发起节点请求
+	// Make request for missing cache data
 	data, err := dispatch(_jsonrpcs)
-
 	if err != nil {
 		return nil, err
 	}
 
-	// 将请求结果填充到最终结果中
-	if _results, ok := data.([]rpc.SealedJSONRPCResult); ok {
-		for i := range _results {
-			indexes := mapping[fmt.Sprint(_results[i].ID)]
-
-			for _, index := range indexes {
-				// 如果已经有缓存结果，则跳过
-				if results[index].Result != nil {
-					continue
+	// Combine results from cache and request
+	if _results, ok := data.([]interface{}); ok && isBatchCall {
+		// For batch requests
+		responseArray := make([]interface{}, len(results))
+		for i := range results {
+			if results[i].Result != nil {
+				// Take from cache
+				responseArray[i] = map[string]interface{}{
+					"jsonrpc":    "2.0",
+					"id":         results[i].ID,
+					"result":     results[i].Result,
+					"error":      results[i].Error,
+					"from_cache": true,
 				}
-				results[index] = _results[i]
+				// Log result from cache
+				a.logger.Info().
+					Uint64("chain_id", chainId).
+					Str("app", appName).
+					Str("method", jsonrpcs[i].Method()).
+					Interface("id", results[i].ID).
+					Bool("from_cache", true).
+					Msg("Response details")
 			}
 		}
-
-		return rpc.MarshalJSONRPCResults(results)
+		// Add new results
+		for _, result := range _results {
+			if resultMap, ok := result.(map[string]interface{}); ok {
+				id := fmt.Sprint(resultMap["id"])
+				if indexes, ok := mapping[id]; ok {
+					for _, index := range indexes {
+						responseArray[index] = map[string]interface{}{
+							"jsonrpc":    "2.0",
+							"id":         resultMap["id"],
+							"result":     resultMap["result"],
+							"error":      resultMap["error"],
+							"from_cache": false,
+						}
+						// Log result from request
+						a.logger.Info().
+							Uint64("chain_id", chainId).
+							Str("app", appName).
+							Str("method", jsonrpcs[index].Method()).
+							Interface("id", id).
+							Bool("from_cache", false).
+							Msg("Response details")
+					}
+				}
+			}
+		}
+		return json.Marshal(responseArray)
+	} else if result, ok := data.(map[string]interface{}); ok && !isBatchCall {
+		// For single request
+		// Add from_cache field
+		result["from_cache"] = false
+		// Log result
+		a.logger.Info().
+			Uint64("chain_id", chainId).
+			Str("app", appName).
+			Str("method", jsonrpcs[0].Method()).
+			Interface("id", result["id"]).
+			Bool("from_cache", false).
+			Msg("Response details")
+		return json.Marshal(result)
 	}
 
-	return rpc.MarshalJSONRPCResults(data)
+	return json.Marshal(data)
 }
 
 func (a agentService) call(ctx context.Context, rc reqctx.Reqctxs, endpoints []*endpoint.Endpoint, jsonrpcs []rpc.JSONRPCer) (results []rpc.SealedJSONRPCResult, err error) {
 	chainId := rc.ChainID()
-	// 获取_endpoints
+	// Get endpoints
 	_endpoints, ok := a.es.Select(ctx, rc, endpoints, jsonrpcs)
 	if !ok || len(_endpoints) <= 0 {
 		a.logger.Error().Msgf("%d No available endpoints", chainId)
 		return nil, common.InternalServerError("No available endpoints")
 	}
 
-	// 改写 ID
-	var (
-		prefix    = helpers.Short(rc.ReqID())
-		_jsonrpcs = []rpc.SealedJSONRPC{}
-	)
-	for i := range jsonrpcs {
-		_jsonrpc := jsonrpcs[i].Seal()
-		_jsonrpc.ID += prefix + _jsonrpc.ID
-		_jsonrpcs = append(_jsonrpcs, _jsonrpc)
+	// Get current block number for caching
+	currentBlock, err := a.getCurrentBlock(ctx, rc, _endpoints)
+	if err != nil {
+		a.logger.Warn().Err(err).Msg("Failed to get current block number")
 	}
 
-	// 请求节点（没有命中缓存的jsonrpc）
-	_results, err := a.client.Request(ctx, rc, _endpoints, _jsonrpcs)
+	// Form array of SealedJSONRPC for sending
+	sealedRPCs := make([]rpc.SealedJSONRPC, len(jsonrpcs))
+	for i, jr := range jsonrpcs {
+		sealed := jr.Seal()
+		// Save original ID
+		sealed.ID = fmt.Sprint(jr.Raw()["id"])
+		sealedRPCs[i] = sealed
 
+		a.logger.Debug().
+			Interface("original_id", jr.Raw()["id"]).
+			Interface("sealed_id", sealed.ID).
+			Msg("Processing request")
+	}
+
+	// Send request
+	_results, err := a.client.Request(ctx, rc, _endpoints, sealedRPCs)
 	if err != nil {
 		return nil, err
 	}
 
-	// 绑定 jsonrpc, 方便json.Marshal()时， jsonrpc, id 与jsonrpcs保持一致
+	// Transform results and save to cache
 	results = make([]rpc.SealedJSONRPCResult, len(_results))
-	for i := range _results {
-		if j := slices.IndexFunc(_jsonrpcs, func(_jsonrpc rpc.SealedJSONRPC) bool {
-			return _jsonrpc.ID == _results[i].ID()
-		}); j >= 0 {
-			results[i] = jsonrpcs[j].MakeResult(_results[i].Result(), _results[i].Error())
-		} else {
-			results[i] = rpc.SealedJSONRPCResult{}
-
-			if _results[i].ID() != "" {
-				results[i].ID = _results[i].ID()
-			}
-			if _results[i].Version() != "" {
-				results[i].Version = _results[i].Version()
-			}
-			if _results[i].Result() != nil {
-				results[i].Result = _results[i].Result()
-			}
-			if _results[i].Error() != nil {
-				results[i].Error = _results[i].Error()
-			}
+	for i, result := range _results {
+		results[i] = rpc.SealedJSONRPCResult{
+			ID:        result.Raw()["id"],
+			Version:   result.Version(),
+			Result:    result.Result(),
+			Error:     result.Error(),
+			FromCache: false,
 		}
-	}
 
-	// 将结果写入缓存
-	if !a.config.DisableCache {
-		for i := range results {
-			// 批量写入缓存
-			if jsonrpc, ok := slice.Find(jsonrpcs, func(_ int, jsonrpc rpc.JSONRPCer) bool {
-				return jsonrpc.Raw()["id"] == results[i].ID
-			}); ok && _results[i].Type() == rpc.JSONRPC_RESPONSE {
-				// 如果客户端指定使用缓存参数，才写缓存
-				if ok, _ := _WithCache(a.config.CacheMethods, *jsonrpc); ok {
-					key := _CacheKey(chainId, *jsonrpc)
-					if data, err := json.Marshal(results[i].Result); err == nil {
-						if len(data) > a.config.MaxEntryCacheSize {
-							// 压缩
-							go func(k string, v []byte) {
-								defer func() {
-									if err := recover(); err != nil {
-										a.logger.Error().Interface("error", err).Msg("Failed to set cache result")
-									}
-								}()
+		// Check ID correspondence
+		if i < len(jsonrpcs) {
+			originalID := jsonrpcs[i].Raw()["id"]
+			if fmt.Sprint(results[i].ID) != fmt.Sprint(originalID) {
+				a.logger.Warn().
+					Interface("original_id", originalID).
+					Interface("result_id", results[i].ID).
+					Msg("Response ID does not match request ID")
+				results[i].ID = originalID
+			}
 
-								if compressed, err := helpers.Compress(v); err != nil {
-									a.logger.Error().Err(err).Msg("Failed to compress")
-								} else {
-									// skip set cache, data is bigger than cache size after compression
-									if len(compressed) > a.config.MaxEntryCacheSize {
-										return
-									}
-									v = compressed
-								}
-
-								// 写内存
-								if err := _SetCache(a.cache, k, &CacheEntry{V: v, T: time.Now().UnixMilli(), compressed: true}); err != nil {
-									a.logger.Error().Err(err).Msg("Cache set error")
-								}
-							}(key, data)
-						} else {
-							if err := _SetCache(a.cache, key, &CacheEntry{V: results[i].Result, T: time.Now().UnixMilli()}); err != nil {
-								a.logger.Error().Err(err).Msg("Cache set error")
-							}
-						}
-
-						a.logger.Debug().Msgf("Cache capacity: %d, len: %d", a.cache.Capacity(), a.cache.Len())
-					}
+			// Save result to cache
+			method := jsonrpcs[i].Method()
+			if a.canCache(method) && results[i].Error == nil {
+				key := a.cacheKey(chainId, jsonrpcs[i])
+				if err := a.setCache(key, results[i].Result, method, currentBlock); err != nil {
+					a.logger.Warn().
+						Err(err).
+						Str("method", method).
+						Str("key", key).
+						Msg("Failed to cache result")
+				} else {
+					a.logger.Debug().
+						Str("method", method).
+						Str("key", key).
+						Msg("Cached result")
 				}
 			}
 		}
 	}
 
 	return results, nil
+}
+
+// canCache checks if the method can be cached
+func (a agentService) canCache(method string) bool {
+	if a.config.CacheMethods == nil {
+		return false
+	}
+	_, ok := a.config.CacheMethods[method]
+	return ok
+}
+
+// shouldInvalidateCache checks if the cache should be invalidated
+func (a agentService) shouldInvalidateCache(method string, entry *CacheEntry, currentBlock *string) bool {
+	if entry == nil || a.config.CacheMethods == nil {
+		return true
+	}
+
+	config, ok := a.config.CacheMethods[method]
+	if !ok {
+		return true
+	}
+
+	// Check TTL
+	if time.Since(time.Unix(entry.T, 0)) > config.TTL {
+		return true
+	}
+
+	// Check block number if needed
+	if config.InvalidateOnBlock && currentBlock != nil && entry.BlockNum != nil {
+		return *currentBlock != *entry.BlockNum
+	}
+
+	return false
+}
+
+// cacheKey generates a cache key
+func (a agentService) cacheKey(chainId uint64, jsonrpc rpc.JSONRPCer) string {
+	return fmt.Sprintf("%d:%s:%s", chainId, jsonrpc.Method(), helpers.Short(fmt.Sprint(jsonrpc.Raw())))
+}
+
+// getCache retrieves a value from cache
+func (a agentService) getCache(key string, method string, currentBlock *string) (interface{}, error) {
+	data, err := a.cache.Get(key)
+	if err == bigcache.ErrEntryNotFound {
+		return nil, fmt.Errorf("cache entry not found")
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var entry CacheEntry
+	if err := json.Unmarshal(data, &entry); err != nil {
+		return nil, err
+	}
+
+	// Check cache validity
+	if a.shouldInvalidateCache(method, &entry, currentBlock) {
+		return nil, nil
+	}
+
+	if entry.compressed {
+		if decompressed, err := helpers.Decompress(entry.V.([]byte)); err != nil {
+			return nil, err
+		} else {
+			var result interface{}
+			if err := json.Unmarshal(decompressed, &result); err != nil {
+				return nil, err
+			}
+			return result, nil
+		}
+	}
+
+	return entry.V, nil
+}
+
+// setCache stores a value in cache
+func (a agentService) setCache(key string, value interface{}, method string, currentBlock *string) error {
+	if !a.canCache(method) {
+		return nil
+	}
+
+	entry := CacheEntry{
+		V:        value,
+		T:        time.Now().Unix(),
+		BlockNum: currentBlock,
+	}
+
+	// Check value size
+	jsonData, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+
+	// If size exceeds limit - compress
+	if len(jsonData) > a.config.MaxEntryCacheSize {
+		compressed, err := helpers.Compress(jsonData)
+		if err != nil {
+			return err
+		}
+		entry.V = compressed
+		entry.compressed = true
+	}
+
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+
+	return a.cache.Set(key, data)
+}
+
+// getCurrentBlock gets the current block number
+func (a agentService) getCurrentBlock(ctx context.Context, rc reqctx.Reqctxs, endpoints []*endpoint.Endpoint) (*string, error) {
+	blockNumberRPC := rpc.NewJSONRPC(map[string]any{
+		"method": "eth_blockNumber",
+		"params": []any{},
+		"id":     "block_number",
+	})
+	sealed := blockNumberRPC.Seal()
+
+	results, err := a.client.Request(ctx, rc, endpoints, []rpc.SealedJSONRPC{sealed})
+	if err != nil {
+		return nil, err
+	}
+
+	if len(results) > 0 && results[0].Result() != nil {
+		blockNum := fmt.Sprint(results[0].Result())
+		return &blockNum, nil
+	}
+
+	return nil, nil
 }

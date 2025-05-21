@@ -39,6 +39,7 @@ type agentController struct {
 
 type AgentController interface {
 	HandleCall(ctx *fasthttp.RequestCtx)
+	HandleWebSocket(ctx *fasthttp.RequestCtx)
 }
 
 func NewAgentController(

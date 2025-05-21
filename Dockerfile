@@ -1,27 +1,39 @@
-FROM golang:alpine as builder
-
-ENV GOPROXY https://proxy.golang.org,direct
-
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories \
-    && apk update --no-cache \
-    && apk add --no-cache tzdata upx openssl \
-    && update-ca-certificates
+FROM golang:1.21-alpine AS builder
 
 WORKDIR /app
 
-COPY go.* ./
+# Install build dependencies
+RUN apk add --no-cache git
+
+# Copy and download dependencies
+COPY go.mod go.sum ./
 RUN go mod download
+
+# Copy source code
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o /bin/web3rpcproxy ./cmd/main.go
-RUN upx -9 /bin/web3rpcproxy
+# Build the application
+RUN CGO_ENABLED=0 GOOS=linux go build -o web3-rpc-proxy ./cmd/main.go
 
-FROM gcr.io/distroless/static:nonroot
+# Final stage
+FROM alpine:latest
+
 WORKDIR /app
-COPY --from=builder /bin/web3rpcproxy /bin/web3rpcproxy
-COPY --from=builder --chown=nonroot /app/config /app/config
 
-EXPOSE 8080
-EXPOSE 8000
+# Create non-root user
+RUN addgroup -g 1000 appuser && \
+    adduser -u 1000 -G appuser -s /bin/sh -D appuser
 
-ENTRYPOINT ["/bin/web3rpcproxy"]
+# Create logs directory with proper permissions
+RUN mkdir -p /app/logs && \
+    chown -R appuser:appuser /app && \
+    chmod -R 755 /app
+
+# Copy binary from builder
+COPY --from=builder /app/web3-rpc-proxy .
+
+# Switch to non-root user
+USER appuser
+
+# Command to run the executable
+CMD ["./web3-rpc-proxy"]

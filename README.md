@@ -141,6 +141,30 @@ For details on the JSON-RPC call body, see [JSON-RPC API METHODS](https://ethere
 ## :wrench: Configuration
 See [the default configuration file](config/default.yaml)
 
+### Cache Configuration
+
+The cache configuration is specified in the `cache.results.expiry_durations` section of the configuration file. Each method can have its own caching rules:
+
+```yaml
+cache:
+  results:
+    disable: false  # Enable/disable caching globally
+    size: 512MB    # Total cache size
+    expiry_durations:
+      eth_getBalance:
+        ttl: 15s
+        invalidate_on_block: true
+      eth_getCode:
+        ttl: 1m
+        invalidate_on_block: false
+      eth_blockNumber:
+        ttl: 5s
+        invalidate_on_block: true
+```
+
+- `ttl`: Time To Live - how long the cached result is considered valid
+- `invalidate_on_block`: Whether to invalidate the cache when a new block is detected
+
 <br>
 
 ## :technologist: Development

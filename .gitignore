@@ -35,3 +35,4 @@ dist/
 __pycache__/
 
 .env
+logs/

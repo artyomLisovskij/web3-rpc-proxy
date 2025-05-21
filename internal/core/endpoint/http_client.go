@@ -105,7 +105,7 @@ func (e *httpClient) Call(ctx context.Context, data []rpc.SealedJSONRPC, profile
 		profile = profiles[0]
 	}
 
-	// 请求
+	// Request
 	now := time.Now()
 	resp, err := e.request(ctx, b)
 
@@ -121,7 +121,7 @@ func (e *httpClient) Call(ctx context.Context, data []rpc.SealedJSONRPC, profile
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		e.logger.Error().Msgf("Error sending request: %v", err)
+		e.logger.Error().Msgf("Error reading response: %v", err)
 		profile.Code = "connection_error"
 		profile.Error = err.Error()
 		return nil, common.UpstreamServerError("Reading response failed", err)
@@ -149,14 +149,21 @@ func (e *httpClient) Call(ctx context.Context, data []rpc.SealedJSONRPC, profile
 		return results, nil
 	}
 
-	// maybe is single result
-	if len(results) != len(data) {
-		return results, nil
-	}
+	// Check if the ID and results match
+	for i, result := range results {
+		if i < len(data) {
+			e.logger.Debug().
+				Interface("request_id", data[i].ID).
+				Interface("response_id", result.ID()).
+				Interface("result", result.Result()).
+				Msg("Checking result")
 
-	if e.config.JSONRPCSchema != nil {
-		if err := validateResults(e.logger, e.config.JSONRPCSchema, profile, data, results); err != nil {
-			return nil, common.UpstreamServerError("Validating response failed", err)
+			if result.Result() == nil {
+				e.logger.Warn().
+					Interface("request", data[i]).
+					Interface("response", result.Raw()).
+					Msg("Received null result for request")
+			}
 		}
 	}
 

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
@@ -36,12 +35,15 @@ type websocketClient struct {
 	config   *websocketClientConfig
 }
 
-// background() 是常驻的goroutine，用于监听websocket结果消息
-// request() 用于发送websocket请求，并等待结果，结果通过请求的的id集关联的通道返回
-// 所以Call()方法不会有非格式化的异常结果，如http页面，文本，解析错误等。统一会被认为是连接错误
+// background() is a constant goroutine used to listen for websocket result messages
+// request() is used to send a websocket request and wait for the result, the result is returned through the channel associated with the request's id
+// Therefore, the Call() method will not have unformatted exceptions such as http pages, text, parsing errors, etc. They will all be considered connection errors
 func NewWebSocketClient(endpoint *Endpoint, config *websocketClientConfig) Client {
 	url := endpoint.Url().String()
-	logger := zerolog.New(os.Stderr).With().Timestamp().Str("name", "web socket endpoint").Str("url", url).Logger()
+	logger := zerolog.New(zerolog.ConsoleWriter{Out: os.Stdout}).With().Timestamp().
+		Str("name", "web socket endpoint").
+		Str("url", url).
+		Logger()
 	if url == "" {
 		return nil
 	}
@@ -65,16 +67,21 @@ func NewWebSocketClient(endpoint *Endpoint, config *websocketClientConfig) Clien
 
 func getJSONResultKey(data []rpc.JSONRPCResulter) string {
 	ids := slice.Map(data, func(i int, result rpc.JSONRPCResulter) string {
-		return result.ID()
+		return fmt.Sprint(result.Raw()["id"])
 	})
 	slice.Sort(ids)
 	return helpers.Short(slice.Join(ids, ""))
 }
 
 func background(ctx context.Context, logger zerolog.Logger, conn *websocket.Conn, sessions *sync.Map) {
+	if conn == nil {
+		logger.Error().Msg("WebSocket connection is nil")
+		return
+	}
+
 	defer func() {
 		if err := recover(); err != nil {
-			logger.Error().Interface("error", err).Msg("Failed to revceive message")
+			logger.Error().Interface("error", err).Msg("Failed to receive message")
 		}
 	}()
 
@@ -86,40 +93,64 @@ func background(ctx context.Context, logger zerolog.Logger, conn *websocket.Conn
 			messageType, message, err := conn.ReadMessage()
 			if err != nil {
 				logger.Warn().Msgf("Error reading message: %v", err)
-				// 检查是否是因为连接失败导致的错误
-				if websocket.IsCloseError(err, websocket.CloseAbnormalClosure, websocket.CloseInternalServerErr) || err == websocket.ErrCloseSent || err == io.ErrUnexpectedEOF {
+				// Check if the error is a result of connection closure
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 					return
+				}
+				continue
+			}
+
+			if messageType != websocket.TextMessage {
+				logger.Warn().Msgf("Unexpected message type: %d", messageType)
+				continue
+			}
+
+			// Parse the response
+			results, _, err := rpc.UnmarshalJSONRPCResults(message)
+			if err != nil {
+				logger.Error().Err(err).Str("message", string(message)).Msg("Failed to unmarshal response")
+				continue
+			}
+
+			// Log response details
+			logger.Info().
+				Str("raw_response", string(message)).
+				Interface("results", results).
+				Msg("Received WebSocket response")
+
+			// Check results for null
+			for _, result := range results {
+				if result.Result() == nil {
+					logger.Info().
+						Str("method", "eth_blockNumber"). // Add method for filtering
+						Interface("id", result.ID()).
+						Interface("raw_response", result.Raw()).
+						Msg("Received null result from WebSocket endpoint")
 				}
 			}
 
-			if messageType == websocket.TextMessage {
-				results, isBatchResult, err := rpc.UnmarshalJSONRPCResults(message)
-				if err != nil {
-					logger.Warn().Msgf("Failed to unmarshal message: %s", message)
-					continue
+			// Get key for session search
+			key := getJSONResultKey(results)
+			if v, ok := sessions.Load(key); ok {
+				if ch, ok := v.(chan []rpc.JSONRPCResulter); ok && ch != nil {
+					logger.Debug().
+						Str("key", key).
+						Interface("results", results).
+						Msg("Sending results to channel")
+					ch <- results
 				}
-
-				if !isBatchResult && len(results) == 1 && results[0].Type() == rpc.JSONRPC_ERROR {
-					sessions.Range(func(key, value interface{}) bool {
-						if c := value.(chan []rpc.JSONRPCResulter); c != nil {
-							c <- results
-							return false
-						}
-						return true
-					})
-				}
-
-				key := getJSONResultKey(results)
-				if c, ok := sessions.Load(key); ok {
-					c.(chan []rpc.JSONRPCResulter) <- results
-				}
+			} else {
+				logger.Warn().
+					Str("key", key).
+					Interface("results", results).
+					Msg("No session found for response")
 			}
 		}
 	}
 }
 
 func (e *websocketClient) connect(ctx context.Context) *websocket.Conn {
-	// 设置请求头
+	// Set request headers
 	headers := make(http.Header)
 	headers.Set("Content-Type", "application/json")
 	if _headers := e.endpoint.Headers(); _headers != nil {
@@ -135,8 +166,8 @@ func (e *websocketClient) connect(ctx context.Context) *websocket.Conn {
 		dialer.TLSClientConfig = e.config.Transport.TLSClientConfig.Clone()
 	}
 
-	// 连接URL，确保使用ws或wss://前缀
-	// Dial函数用于连接到WebSocket服务器
+	// Connect to URL, ensuring the use of ws or wss:// prefix
+	// Dial function is used to connect to the WebSocket server
 	_connect := func(ctx context.Context) *websocket.Conn {
 		var (
 			duration int64 = 0
@@ -164,7 +195,7 @@ func (e *websocketClient) connect(ctx context.Context) *websocket.Conn {
 		duration = time.Since(now).Milliseconds()
 		health = true
 
-		// 开启监听wss、发送消息、接收消息
+		// Start listening wss, sending messages, receiving messages
 		_ctx, _cancel := context.WithCancel(context.Background())
 		e.ctx = _ctx
 		e.cancel = _cancel
@@ -173,14 +204,14 @@ func (e *websocketClient) connect(ctx context.Context) *websocket.Conn {
 		return conn
 	}
 
-	// 连接
+	// Connect
 	conn := _connect(ctx)
 
 	if conn == nil {
 		return nil
 	}
 
-	// 设置关闭回调,用于重连
+	// Set close callback, for reconnection
 	conn.SetCloseHandler(func(code int, text string) error {
 		e.logger.Warn().Msgf("Closing connection code %d and text %s", code, text)
 
@@ -191,7 +222,7 @@ func (e *websocketClient) connect(ctx context.Context) *websocket.Conn {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		oldConn, oldCancel := e.conn, e.cancel
-		// 重连
+		// Reconnect
 		e.conn = _connect(ctx)
 		cancel()
 
@@ -208,16 +239,31 @@ func (e *websocketClient) connect(ctx context.Context) *websocket.Conn {
 }
 
 func (e *websocketClient) Close() error {
-	message := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
-	e.conn.WriteControl(websocket.CloseMessage, message, time.Now().Add(time.Second))
-	time.AfterFunc(time.Second, func() {
-		e.conn.Close()
+	if e == nil || e.conn == nil {
+		return nil
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.cancel != nil {
 		e.cancel()
-	})
+	}
+
+	message := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
+	if err := e.conn.WriteControl(websocket.CloseMessage, message, time.Now().Add(time.Second)); err != nil {
+		e.logger.Error().Err(err).Msg("Error sending close message")
+	}
+
+	if err := e.conn.Close(); err != nil {
+		e.logger.Error().Err(err).Msg("Error closing connection")
+		return err
+	}
+
 	return nil
 }
 
-// 判断是否是 "broken pipe" 错误
+// Check if the error is a result of connection closure
 func isBrokenPipeError(err error) bool {
 	var netErr *net.OpError
 	if errors.As(err, &netErr) {
@@ -229,34 +275,60 @@ func isBrokenPipeError(err error) bool {
 }
 
 func (e *websocketClient) request(ctx context.Context, key string, b []byte) ([]rpc.JSONRPCResulter, common.HTTPErrors) {
+	if e == nil || e.conn == nil {
+		return nil, common.UpstreamServerError("WebSocket connection is nil", nil)
+	}
+
 	c := make(chan []rpc.JSONRPCResulter)
 	e.sessions.Store(key, c)
 	defer func() {
 		if c, ok := e.sessions.Load(key); ok {
 			e.sessions.Delete(key)
-			close(c.(chan []rpc.JSONRPCResulter))
+			if ch, ok := c.(chan []rpc.JSONRPCResulter); ok && ch != nil {
+				close(ch)
+			}
 		}
 		_EndpointGauge(e.endpoint).Dec()
 	}()
 
 	_EndpointGauge(e.endpoint).Inc()
 	e.mu.Lock()
+	e.logger.Debug().Str("request_body", string(b)).Msg("Sending WebSocket request")
 	err := e.conn.WriteMessage(websocket.TextMessage, b)
 	e.mu.Unlock()
 
 	if err != nil {
-		e.logger.Warn().Msgf("Creating request %s %s", e.endpoint.Url(), b)
+		e.logger.Warn().Msgf("Creating request %s %s", e.endpoint.Url(), string(b))
 		e.logger.Error().Msgf("Error creating request: %v", err)
 
 		if isBrokenPipeError(err) {
-			_ctx, cancel := context.WithTimeoutCause(context.Background(), time.Second, nil)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			e.mu.Lock()
-			conn := e.connect(_ctx)
+			conn := e.connect(ctx)
 			if conn != nil {
 				e.conn = conn
+				// Repeat sending message after reconnection
+				err = e.conn.WriteMessage(websocket.TextMessage, b)
 			}
 			e.mu.Unlock()
 			cancel()
+
+			if err == nil {
+				// If repeated sending is successful, wait for the answer
+				select {
+				case results, ok := <-c:
+					if !ok {
+						return nil, common.UpstreamServerError("Error connection to endpoint", nil)
+					}
+					e.logger.Debug().
+						Interface("results", results).
+						Str("request_body", string(b)).
+						Msg("Received response after reconnect")
+					return results, nil
+				case <-ctx.Done():
+					return nil, common.TimeoutError("context deadline exceeded")
+				}
+			}
 		}
 
 		if _err, ok := err.(*net.OpError); ok {
@@ -271,6 +343,24 @@ func (e *websocketClient) request(ctx context.Context, key string, b []byte) ([]
 		if !ok {
 			return nil, common.UpstreamServerError("Error connection to endpoint", nil)
 		}
+		e.logger.Debug().
+			Interface("results", results).
+			Str("request_body", string(b)).
+			Str("key", key).
+			Msg("Received WebSocket response")
+
+		// Check results for null
+		if len(results) > 0 {
+			for _, result := range results {
+				if result.Result() == nil {
+					e.logger.Warn().
+						Interface("result", result.Raw()).
+						Str("request_body", string(b)).
+						Msg("Received null result from upstream")
+				}
+			}
+		}
+
 		return results, nil
 	case <-ctx.Done():
 		return nil, common.TimeoutError("context deadline exceeded")
@@ -285,25 +375,36 @@ func getJSONRPCKey(data []rpc.SealedJSONRPC) string {
 	return helpers.Short(slice.Join(ids, ""))
 }
 
+func init() {
+	// Open log file in the root directory
+	_, err := os.OpenFile("/app/websocket.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Printf("Error opening log file: %v\n", err)
+		return
+	}
+}
+
 func (e *websocketClient) Call(ctx context.Context, data []rpc.SealedJSONRPC, profiles ...*common.ResponseProfile) (results []rpc.JSONRPCResulter, err error) {
 	b, err := json.Marshal(data)
 	if err != nil {
 		return nil, common.InternalServerError("Marshalling request failed", err)
 	}
 
+	// Direct output to stdout
+	fmt.Printf("🚀 Sending request: %s\n", string(b))
+
 	var profile = &common.ResponseProfile{}
 	if len(profiles) > 0 {
 		profile = profiles[0]
 	}
 
-	// 请求
+	// Request
 	now, key := time.Now(), getJSONRPCKey(data)
 	results, err = e.request(ctx, key, b)
 	profile.Duration = time.Since(now).Milliseconds()
 
-	defer updateMetrics(e.endpoint, profile)
-
 	if err != nil {
+		fmt.Printf("❌ Request error: %v\n", err)
 		switch err.Error() {
 		case "Error connection to endpoint":
 			profile.Code = "connection_error"
@@ -314,6 +415,8 @@ func (e *websocketClient) Call(ctx context.Context, data []rpc.SealedJSONRPC, pr
 		return nil, err
 	}
 
+	fmt.Printf("📥 Received response: %+v\n", results)
+
 	body, err := json.Marshal(results)
 	if err == nil {
 		profile.Status = 200
@@ -322,22 +425,30 @@ func (e *websocketClient) Call(ctx context.Context, data []rpc.SealedJSONRPC, pr
 
 	if len(results) > 0 {
 		if r := results[len(results)-1]; r.Type() == rpc.JSONRPC_ERROR {
+			fmt.Printf("⚠️ Error received: %+v\n", r.Error())
 			recordingErrorResult(profile, r)
 			return results, nil
 		}
-	}
 
-	// maybe is single result
-	if len(results) != len(data) {
-		return results, nil
-	}
+		// Check ID and results correspondence
+		for i, result := range results {
+			if i < len(data) {
+				fmt.Printf("🔍 Checking result:\n")
+				fmt.Printf("   Method: %s\n", data[i].Method)
+				fmt.Printf("   Request ID: %v\n", data[i].ID)
+				fmt.Printf("   Response ID: %v\n", result.ID())
+				fmt.Printf("   Result: %+v\n", result.Result())
 
-	// maybe includes normal results, should be validate by schema
-	if e.config.JSONRPCSchema != nil {
-		if err := validateResults(e.logger, e.config.JSONRPCSchema, profile, data, results); err != nil {
-			return nil, common.UpstreamServerError("Validating response failed", err)
+				if result.Result() == nil {
+					fmt.Printf("⚠️ Null result received:\n")
+					fmt.Printf("   Method: %s\n", data[i].Method)
+					fmt.Printf("   Request: %+v\n", data[i])
+					fmt.Printf("   Response: %+v\n", result.Raw())
+				}
+			}
 		}
 	}
 
+	fmt.Printf("=== End WebSocket Debug Log ===\n\n")
 	return results, nil
 }

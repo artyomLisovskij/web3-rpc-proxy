@@ -2,7 +2,7 @@ package rpc
 
 import (
 	"encoding/json"
-	"strconv"
+	"fmt"
 
 	"github.com/duke-git/lancet/v2/slice"
 )
@@ -40,19 +40,22 @@ type JSONRPCer interface {
 }
 
 func UnmarshalJSONRPCs(b []byte) (jsonrpcs []JSONRPCer, batch bool, err error) {
+	// First try to parse as an array
 	var raws []map[string]any
-	if err := json.Unmarshal(b, &raws); err != nil {
-		var raw map[string]any
-		if err := json.Unmarshal(b, &raw); err != nil {
-			return nil, false, err
-		}
+	if err := json.Unmarshal(b, &raws); err == nil {
+		return slice.Map(raws, func(i int, raw map[string]any) JSONRPCer {
+			return NewJSONRPC(raw)
+		}), true, nil
+	}
 
+	// If not an array, try to parse as a single object
+	var raw map[string]any
+	if err := json.Unmarshal(b, &raw); err == nil {
 		return []JSONRPCer{NewJSONRPC(raw)}, false, nil
 	}
 
-	return slice.Map(raws, func(i int, raw map[string]any) JSONRPCer {
-		return NewJSONRPC(raw)
-	}), true, nil
+	// If both attempts failed, return error
+	return nil, false, err
 }
 
 // 输出给端点的格式
@@ -95,14 +98,10 @@ func (req jsonrpc) RawParams() any {
 }
 
 func (req jsonrpc) ID() string {
-	if id, ok := req.raw["id"].(float64); ok {
-		_id := strconv.FormatInt(int64(id), 16)
-		return _id
-	} else if req.raw["id"] != nil {
-		_id := req.raw["id"].(string)
-		return _id
+	if req.raw["id"] == nil {
+		return "null"
 	}
-	return ""
+	return fmt.Sprint(req.raw["id"])
 }
 
 func (req jsonrpc) Version() JSONRPC_Version {
@@ -154,7 +153,7 @@ func (req jsonrpc) Seal() SealedJSONRPC {
 func (req jsonrpc) MakeResult(value any, err any) SealedJSONRPCResult {
 	return SealedJSONRPCResult{
 		ID:      req.raw["id"],
-		Version: req.raw["jsonrpc"].(string),
+		Version: req.RawVersion(),
 		Result:  value,
 		Error:   err,
 	}
@@ -183,53 +182,61 @@ type JSONRPCResulter interface {
 }
 
 func UnmarshalJSONRPCResults(b []byte) (results []JSONRPCResulter, batch bool, err error) {
+	// First try to parse as an array
 	var raws []map[string]any
-	if err := json.Unmarshal(b, &raws); err != nil {
-		var raw map[string]any
-		if err := json.Unmarshal(b, &raw); err != nil {
-			return nil, false, err
-		}
+	if err := json.Unmarshal(b, &raws); err == nil {
+		return slice.Map(raws, func(i int, raw map[string]any) JSONRPCResulter {
+			return NewJSONRPCResult(raw)
+		}), true, nil
+	}
 
+	// If array parsing failed, try as a single object
+	var raw map[string]any
+	if err := json.Unmarshal(b, &raw); err == nil {
 		return []JSONRPCResulter{NewJSONRPCResult(raw)}, false, nil
 	}
 
-	return slice.Map(raws, func(i int, raw map[string]any) JSONRPCResulter {
-		return NewJSONRPCResult(raw)
-	}), true, nil
+	// If both attempts failed, return error
+	return nil, false, err
 }
 
 // 输出给客户端的格式
 type SealedJSONRPCResult struct {
-	ID      any    `json:"id"`
-	Result  any    `json:"result,omitempty"`
-	Error   any    `json:"error,omitempty"`
-	Version string `json:"jsonrpc,omitempty"`
+	ID        any    `json:"id"`
+	Result    any    `json:"result,omitempty"`
+	Error     any    `json:"error,omitempty"`
+	Version   string `json:"jsonrpc,omitempty"`
+	FromCache bool   `json:"from_cache"`
 }
 
 func (res SealedJSONRPCResult) MarshalJSON() ([]byte, error) {
 	if res.Error != nil {
 		return json.Marshal(struct {
-			ID      any    `json:"id"`
-			Result  any    `json:"result,omitempty"`
-			Error   any    `json:"error"`
-			Version string `json:"jsonrpc,omitempty"`
+			ID        any    `json:"id"`
+			Result    any    `json:"result,omitempty"`
+			Error     any    `json:"error"`
+			Version   string `json:"jsonrpc,omitempty"`
+			FromCache bool   `json:"from_cache"`
 		}{
-			ID:      res.ID,
-			Version: res.Version,
-			Result:  res.Result,
-			Error:   res.Error,
+			ID:        res.ID,
+			Version:   res.Version,
+			Result:    res.Result,
+			Error:     res.Error,
+			FromCache: res.FromCache,
 		})
 	}
 	return json.Marshal(struct {
-		ID      any    `json:"id"`
-		Result  any    `json:"result"`
-		Error   any    `json:"error,omitempty"`
-		Version string `json:"jsonrpc,omitempty"`
+		ID        any    `json:"id"`
+		Result    any    `json:"result"`
+		Error     any    `json:"error,omitempty"`
+		Version   string `json:"jsonrpc,omitempty"`
+		FromCache bool   `json:"from_cache"`
 	}{
-		ID:      res.ID,
-		Version: res.Version,
-		Result:  res.Result,
-		Error:   res.Error,
+		ID:        res.ID,
+		Version:   res.Version,
+		Result:    res.Result,
+		Error:     res.Error,
+		FromCache: res.FromCache,
 	})
 }
 
@@ -242,21 +249,19 @@ func NewJSONRPCResult(raw map[string]any) JSONRPCResulter {
 }
 
 func (res jsonrpc_result) ID() string {
-	if id, ok := res.raw["id"].(float64); ok {
-		_id := strconv.FormatInt(int64(id), 16)
-		return _id
-	} else if res.raw["id"] != nil {
-		_id := res.raw["id"].(string)
-		return _id
+	if res.raw["id"] == nil {
+		return "null"
 	}
-	return ""
+	return fmt.Sprint(res.raw["id"])
 }
+
 func (res jsonrpc_result) Version() JSONRPC_Version {
 	if version, ok := res.raw["jsonrpc"].(string); ok {
 		return version
 	}
 	return JSONRPC_VERSION_1
 }
+
 func (res jsonrpc_result) Result() any {
 	return res.raw["result"]
 }
@@ -287,7 +292,7 @@ func (res jsonrpc_result) UnmarshalJSON(b []byte) error {
 
 func (res jsonrpc_result) MarshalJSON() ([]byte, error) {
 	result := SealedJSONRPCResult{
-		ID:      res.ID(),
+		ID:      res.raw["id"],
 		Version: res.Version(),
 		Result:  res.Result(),
 		Error:   res.Error(),

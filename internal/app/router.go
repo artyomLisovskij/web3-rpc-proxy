@@ -5,7 +5,7 @@ import (
 )
 
 type Router struct {
-	app *Application
+	app   *Application
 	Agent controller.AgentController
 	Other controller.OtherController
 }
@@ -31,4 +31,8 @@ func (c *Router) RegisterRoutes() {
 	c.app.Router.POST("/{chain}", c.Agent.HandleCall)
 	c.app.Router.POST("/{apikey}/{chain}", c.Agent.HandleCall)
 	c.app.Router.POST("/rpc/{chain}", c.Agent.HandleCall)
+
+	// WebSocket routes
+	c.app.Router.GET("/ws/{chain}", c.Agent.HandleWebSocket)
+	c.app.Router.GET("/ws/{apikey}/{chain}", c.Agent.HandleWebSocket)
 }

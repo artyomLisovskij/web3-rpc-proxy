@@ -30,11 +30,13 @@ type Reqctxs interface {
 	AppBucket() string
 	App() *common.App
 	SetApp(app *common.App)
+	SetChain(chain *common.Chain)
 	Profile() *common.QueryProfile
 	Deadline() (deadline time.Time, ok bool)
 	Done() <-chan struct{}
 	Err() error
 	Value(key any) any
+	RequestCtx() *fasthttp.RequestCtx
 }
 
 type reqctx struct {
@@ -58,25 +60,30 @@ func NewReqctx(requestCtx *fasthttp.RequestCtx, cfg *config.Conf, logger zerolog
 			Requests:  []common.RequestProfile{},
 			Responses: []common.ResponseProfile{},
 		},
+		uuid: uuid.NewString(),
 	}
 
-	rc.logger = rc.logger.With().Str("uuid", rc.ReqID()).Str("chain", fmt.Sprint(rc.ChainID())).Logger()
+	rc.logger = rc.logger.With().Str("uuid", rc.uuid).Logger()
 
-	rc.profile.ID = rc.ReqID()
-	rc.profile.Method = string(requestCtx.Method())
-	rc.profile.Href = string(requestCtx.RequestURI())
-	if v := requestCtx.Request.Header.Peek("cf-connecting-ip"); len(v) > 0 {
-		rc.profile.IP = string(v)
-	} else if v := requestCtx.Request.Header.Peek("true-client-ip"); len(v) > 0 {
-		rc.profile.IP = string(v)
-	} else {
-		rc.profile.IP = requestCtx.RemoteIP().String()
-	}
-	if v := requestCtx.Request.Header.Peek("cf-ipcountry"); len(v) > 0 {
-		rc.profile.IPCountry = string(v)
-	}
-	rc.profile.ChainID = rc.ChainID()
+	if requestCtx != nil {
+		rc.logger = rc.logger.With().Str("chain", fmt.Sprint(rc.ChainID())).Logger()
 
+		rc.profile.Method = string(requestCtx.Method())
+		rc.profile.Href = string(requestCtx.RequestURI())
+		if v := requestCtx.Request.Header.Peek("cf-connecting-ip"); len(v) > 0 {
+			rc.profile.IP = string(v)
+		} else if v := requestCtx.Request.Header.Peek("true-client-ip"); len(v) > 0 {
+			rc.profile.IP = string(v)
+		} else {
+			rc.profile.IP = requestCtx.RemoteIP().String()
+		}
+		if v := requestCtx.Request.Header.Peek("cf-ipcountry"); len(v) > 0 {
+			rc.profile.IPCountry = string(v)
+		}
+		rc.profile.ChainID = rc.ChainID()
+	}
+
+	rc.profile.ID = rc.uuid
 	return rc
 }
 
@@ -103,6 +110,9 @@ func (c *reqctx) Logger() *zerolog.Logger {
 }
 
 func (c *reqctx) AppKey() string {
+	if c.requestCtx == nil {
+		return ""
+	}
 	if v := c.requestCtx.UserValue("apikey"); v != nil {
 		return v.(string)
 	} else if v := c.requestCtx.Request.Header.Peek("x-api-key"); len(v) > 0 {
@@ -114,6 +124,9 @@ func (c *reqctx) AppKey() string {
 }
 
 func (c *reqctx) AppBucket() string {
+	if c.requestCtx == nil {
+		return "default"
+	}
 	if v := c.requestCtx.Request.Header.Peek("x-api-bucket"); len(v) > 0 {
 		return string(v)
 	} else if c.requestCtx.Request.URI().QueryArgs().Has("x_api_bucket") {
@@ -123,6 +136,9 @@ func (c *reqctx) AppBucket() string {
 }
 
 func (c *reqctx) QueryArgs() *fasthttp.Args {
+	if c.requestCtx == nil {
+		return &fasthttp.Args{}
+	}
 	return c.requestCtx.Request.URI().QueryArgs()
 }
 
@@ -140,20 +156,15 @@ func (c *reqctx) Options() Options {
 }
 
 func (c *reqctx) ReqID() string {
-	if c.uuid == "" {
-		if v := c.requestCtx.Request.Header.Peek("x-req-id"); len(v) > 0 {
-			c.uuid = string(v)
-		} else if v := c.requestCtx.Request.Header.Peek("x-request-id"); len(v) > 0 {
-			c.uuid = string(v)
-		} else {
-			c.uuid = uuid.NewString()
-		}
-	}
 	return c.uuid
 }
 
 func (c *reqctx) ChainID() common.ChainId {
 	if c.chain == nil {
+		if c.requestCtx == nil {
+			c.chain = &common.Chain{}
+			return c.chain.ID
+		}
 		if v := c.Config().Get(helpers.Concat("chains.", c.requestCtx.UserValue("chain").(string))); v != nil {
 			chain := v.(common.EndpointChain)
 			c.chain = &common.Chain{
@@ -167,11 +178,14 @@ func (c *reqctx) ChainID() common.ChainId {
 			}
 		}
 	}
-
 	return c.chain.ID
 }
 
 func (c *reqctx) Body() *[]byte {
+	if c.requestCtx == nil {
+		empty := make([]byte, 0)
+		return &empty
+	}
 	body := c.requestCtx.PostBody()
 	return &body
 }
@@ -181,19 +195,45 @@ func (c *reqctx) Profile() *common.QueryProfile {
 }
 
 func (c *reqctx) Deadline() (deadline time.Time, ok bool) {
+	if c.requestCtx == nil {
+		return time.Time{}, false
+	}
 	return c.requestCtx.Deadline()
-
 }
+
 func (c *reqctx) Done() <-chan struct{} {
+	if c.requestCtx == nil {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
 	return c.requestCtx.Done()
-
 }
+
 func (c *reqctx) Err() error {
+	if c.requestCtx == nil {
+		return nil
+	}
 	return c.requestCtx.Err()
-
 }
+
 func (c *reqctx) Value(key any) any {
+	if c.requestCtx == nil {
+		return nil
+	}
 	return c.requestCtx.Value(key)
+}
+
+func (c *reqctx) SetChain(chain *common.Chain) {
+	c.chain = chain
+	if c.profile != nil {
+		c.profile.ChainID = chain.ID
+	}
+	c.logger = c.logger.With().Str("chain", fmt.Sprint(chain.ID)).Logger()
+}
+
+func (c *reqctx) RequestCtx() *fasthttp.RequestCtx {
+	return c.requestCtx
 }
 
 type RetryStrategy int8
@@ -281,12 +321,15 @@ func (o *Option) AgreeConverging() bool {
 func (o *Option) AgreeMultiCall() bool {
 	return false
 }
+
 func (o *Option) AllowChainIDs() []string {
 	return nil
 }
+
 func (o *Option) AllowMethods() []string {
 	return nil
 }
+
 func (o *Option) AllowContractAddresses() []string {
 	return nil
 }
