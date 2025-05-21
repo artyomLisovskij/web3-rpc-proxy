@@ -110,7 +110,7 @@ func (a *agentController) HandleWebSocket(ctx *fasthttp.RequestCtx) {
 
 		logWebSocket("👋 Sent welcome message")
 
-		a.logger.Info().Msgf("New WebSocket connection established for chainId=%v", chainId)
+		a.logger.Debug().Msgf("New WebSocket connection established for chainId=%v", chainId)
 
 		// Start ping goroutine
 		done := make(chan struct{})
@@ -153,7 +153,7 @@ func (a *agentController) HandleWebSocket(ctx *fasthttp.RequestCtx) {
 
 			logWebSocket(fmt.Sprintf("📥 Received message: %s", string(message)))
 
-			a.logger.Info().
+			a.logger.Debug().
 				Str("raw_message", string(message)).
 				Msg("Received WebSocket message")
 
@@ -182,14 +182,14 @@ func (a *agentController) HandleWebSocket(ctx *fasthttp.RequestCtx) {
 			if delim, ok := token.(json.Delim); ok && delim == '[' {
 				isBatch = true
 				logWebSocket("📦 Received batch request")
-				a.logger.Info().Msg("Detected batch request")
+				a.logger.Debug().Msg("Detected batch request")
 
 				// Read entire array of requests
 				var batchRequests []map[string]interface{}
 				if err := decoder.Decode(&batchRequests); err == nil {
 					if len(batchRequests) > 0 {
 						requestID = batchRequests[0]["id"]
-						a.logger.Info().
+						a.logger.Debug().
 							Interface("request_id", requestID).
 							Interface("batch_size", len(batchRequests)).
 							Msg("Parsed batch request")
@@ -197,13 +197,13 @@ func (a *agentController) HandleWebSocket(ctx *fasthttp.RequestCtx) {
 				}
 			} else {
 				logWebSocket("📝 Received single request")
-				a.logger.Info().Msg("Detected single request")
+				a.logger.Debug().Msg("Detected single request")
 				// Decode entire request to get ID
 				var request map[string]interface{}
 				decoder = json.NewDecoder(bytes.NewReader(message))
 				if err := decoder.Decode(&request); err == nil {
 					requestID = request["id"]
-					a.logger.Info().
+					a.logger.Debug().
 						Interface("request_id", requestID).
 						Interface("request", request).
 						Msg("Parsed single request")

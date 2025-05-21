@@ -42,8 +42,10 @@ logger:
 #     dsn: 'postgres://your-postgres-host:5432/your_db_name'
 
 # Redis configuration for data caching
-# redis:
-#   url: 'redis://your-redis-host:6379'
+redis:
+  url: 'redis://redis:6379'
+  keeplive-interval: 5s
+  retry-count: 3
 
 # AMQP configuration, after startup, the service will automatically create an exchange
 # based on the following configuration and send request information to this exchange
@@ -60,59 +62,42 @@ logger:
 cache:
   results:
     disable: false
-    size: 1024MB
+    ttl: 15m
     expiry_durations:
       net_version:
         ttl: 99h
-        invalidate_on_block: false
       eth_chainId:
         ttl: 99h
-        invalidate_on_block: false
       # eth_getTransactionCount:
       #   ttl: 24h
-      #   invalidate_on_block: true
       eth_getBlockTransactionCountByNumber:
         ttl: 24h
-        invalidate_on_block: true
       eth_getBlockTransactionCountByHash:
         ttl: 24h
-        invalidate_on_block: true
       eth_getUncleCountByBlockHash:
         ttl: 24h
-        invalidate_on_block: true
       eth_getUncleCountByBlockNumber:
         ttl: 24h
-        invalidate_on_block: true
       eth_blockNumber:
         ttl: 24h
-        invalidate_on_block: true
       eth_getBlockByNumber:
         ttl: 24h
-        invalidate_on_block: true
       eth_getBlockByHash:
         ttl: 24h
-        invalidate_on_block: true
       eth_getTransactionByHash:
         ttl: 24h
-        invalidate_on_block: false
       eth_getTransactionByBlockHashAndIndex:
         ttl: 24h
-        invalidate_on_block: false
       eth_getTransactionByBlockNumberAndIndex:
         ttl: 24h
-        invalidate_on_block: false
       eth_getTransactionReceipt:
         ttl: 24h
-        invalidate_on_block: false
       # eth_getLogs:
       #   ttl: 10m
-      #   invalidate_on_block: true
       eth_getUncleByBlockHashAndIndex:
         ttl: 24h
-        invalidate_on_block: true
       eth_getUncleByBlockNumberAndIndex:
         ttl: 24h
-        invalidate_on_block: true
 
 # Provider configuration, it will auto load external endpoints
 # providers:

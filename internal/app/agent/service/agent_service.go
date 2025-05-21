@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"time"
 
+	"github.com/DODOEX/web3rpcproxy/internal/app/shared"
 	"github.com/DODOEX/web3rpcproxy/internal/common"
 	"github.com/DODOEX/web3rpcproxy/internal/core"
 	"github.com/DODOEX/web3rpcproxy/internal/core/endpoint"
@@ -14,27 +14,23 @@ import (
 	"github.com/DODOEX/web3rpcproxy/internal/core/rpc"
 	"github.com/DODOEX/web3rpcproxy/utils"
 	"github.com/DODOEX/web3rpcproxy/utils/config"
-	"github.com/DODOEX/web3rpcproxy/utils/helpers"
-	"github.com/allegro/bigcache"
+	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 )
 
 type CacheMethodConfig struct {
-	TTL               time.Duration `json:"ttl"`
-	InvalidateOnBlock bool          `json:"invalidate_on_block"`
+	TTL time.Duration `json:"ttl"`
 }
 
 type CacheEntry struct {
-	V          any
-	T          int64
-	BlockNum   *string // Block number at which the request was made
-	compressed bool
+	V any
+	T int64
 }
 
 type agentServiceConfig struct {
-	CacheMethods      map[string]CacheMethodConfig
-	MaxEntryCacheSize int
-	DisableCache      bool
+	CacheMethods map[string]CacheMethodConfig
+	DisableCache bool
+	CacheTTL     time.Duration
 }
 
 // AgentService
@@ -43,7 +39,7 @@ type agentService struct {
 	client     core.Client
 	es         endpoint.Selector
 	jrpcSchema *rpc.JSONRPCSchema
-	cache      *bigcache.BigCache
+	redis      *shared.RedisClient
 	config     *agentServiceConfig
 }
 
@@ -54,22 +50,6 @@ type AgentService interface {
 	Call(ctx context.Context, reqctx reqctx.Reqctxs, endpoints []*endpoint.Endpoint) ([]byte, error)
 }
 
-func nearestPowerOfTwo(n uint) uint {
-	if n == 0 {
-		return 1
-	}
-
-	n--
-	n |= n >> 1
-	n |= n >> 2
-	n |= n >> 4
-	n |= n >> 8
-	n |= n >> 16
-	n++
-
-	return n
-}
-
 // init AgentService
 func NewAgentService(
 	logger zerolog.Logger,
@@ -77,13 +57,14 @@ func NewAgentService(
 	jrpcSchema *rpc.JSONRPCSchema,
 	client core.Client,
 	endpointService EndpointService,
+	redis *shared.RedisClient,
 ) AgentService {
 	logger = logger.With().Str("name", "agent_service").Logger()
 
 	existExpiryConfig := config.Exists("cache.results.expiry_durations")
 	_config := &agentServiceConfig{
-		DisableCache:      config.Bool("cache.results.disable", false) || !existExpiryConfig,
-		MaxEntryCacheSize: 512 * 1024, // 512KB
+		DisableCache: config.Bool("cache.results.disable", false) || !existExpiryConfig,
+		CacheTTL:     config.Duration("cache.results.ttl", 15*time.Minute),
 	}
 
 	if existExpiryConfig {
@@ -92,56 +73,12 @@ func NewAgentService(
 		_config.CacheMethods = expiryConfig
 	}
 
-	// default cache size is 512MB
-	totalCacheSize := config.Int("cache.results.size", 512*1024*1024)
-
-	shards := int(nearestPowerOfTwo(uint(len(endpointService.Chains()))))
-	// must have 8MB size pre shard
-	if totalCacheSize/shards < 8 {
-		shards = int(nearestPowerOfTwo(uint(totalCacheSize / 8)))
-	}
-
-	_cacheConfig := bigcache.Config{
-		// number of shards (must be a power of 2)
-		Shards: shards,
-
-		// time after which entry can be evicted
-		LifeWindow: 15 * time.Minute,
-
-		// Interval between removing expired entries (clean up).
-		// If set to <= 0 then no action is p4erformed.
-		// Setting to < 1 second is counterproductive — bigcache has a one second resolution.
-		CleanWindow: 15 * time.Minute,
-
-		// rps * lifeWindow, used only in initial memory allocation
-		// MaxEntriesInWindow: 1000 * 10 * 60,
-
-		// max entry size in bytes, used only in initial memory allocation
-		MaxEntrySize: _config.MaxEntryCacheSize,
-
-		// prints information about additional memory allocation
-		// Verbose: true,
-
-		// cache will not allocate more memory than this limit, value in MB
-		// if value is reached then the oldest entries can be overridden for the new ones
-		// 0 value means no size limit
-		HardMaxCacheSize: totalCacheSize / 1024 / 1024,
-	}
-	config.Unmarshal("agent.bigcache", &_cacheConfig)
-
-	cache, initErr := bigcache.NewBigCache(_cacheConfig)
-	if initErr != nil {
-		log.Fatal(initErr)
-	}
-
-	logger.Info().Msgf("Cache size: %d MB", _cacheConfig.HardMaxCacheSize)
-
 	service := agentService{
 		config:     _config,
 		client:     client,
 		logger:     logger,
 		jrpcSchema: jrpcSchema,
-		cache:      cache,
+		redis:      redis,
 		es:         endpoint.NewSelector(),
 	}
 
@@ -157,7 +94,7 @@ func (a agentService) Call(ctx context.Context, rc reqctx.Reqctxs, endpoints []*
 	}
 
 	// Log incoming request
-	a.logger.Info().
+	a.logger.Debug().
 		Bool("is_batch", isBatchCall).
 		Str("raw_request", string(*rc.Body())).
 		Interface("parsed_requests", jsonrpcs).
@@ -186,7 +123,7 @@ func (a agentService) Call(ctx context.Context, rc reqctx.Reqctxs, endpoints []*
 		}
 
 		// Log details of each request
-		a.logger.Info().
+		a.logger.Debug().
 			Str("method", jsonrpcs[i].Method()).
 			Interface("id", jsonrpcs[i].ID()).
 			Interface("params", jsonrpcs[i].Params()).
@@ -217,7 +154,7 @@ func (a agentService) Call(ctx context.Context, rc reqctx.Reqctxs, endpoints []*
 		}
 
 		// Log results
-		a.logger.Info().
+		a.logger.Debug().
 			Interface("results", results).
 			Msg("Received RPC results")
 
@@ -274,7 +211,7 @@ func (a agentService) Call(ctx context.Context, rc reqctx.Reqctxs, endpoints []*
 
 	// Check if caching is disabled
 	if a.config.DisableCache {
-		a.logger.Info().
+		a.logger.Debug().
 			Uint64("chain_id", chainId).
 			Str("app", appName).
 			Bool("cache_disabled", a.config.DisableCache).
@@ -284,7 +221,7 @@ func (a agentService) Call(ctx context.Context, rc reqctx.Reqctxs, endpoints []*
 
 	// Check caching settings in request
 	if !rc.Options().Caches() {
-		a.logger.Info().
+		a.logger.Debug().
 			Uint64("chain_id", chainId).
 			Str("app", appName).
 			Bool("option_caches", rc.Options().Caches()).
@@ -303,7 +240,7 @@ func (a agentService) Call(ctx context.Context, rc reqctx.Reqctxs, endpoints []*
 	for i := range jsonrpcs {
 		method := jsonrpcs[i].Method()
 		if !a.canCache(method) {
-			a.logger.Info().
+			a.logger.Debug().
 				Uint64("chain_id", chainId).
 				Str("app", appName).
 				Str("method", method).
@@ -316,7 +253,7 @@ func (a agentService) Call(ctx context.Context, rc reqctx.Reqctxs, endpoints []*
 
 		// Try to get from cache
 		key := a.cacheKey(chainId, jsonrpcs[i])
-		if value, err := a.getCache(key, method, nil); err == nil {
+		if value, err := a.getCache(key, method); err == nil {
 			results[i] = rpc.SealedJSONRPCResult{
 				ID:        jsonrpcs[i].Raw()["id"],
 				Version:   jsonrpcs[i].Version(),
@@ -342,7 +279,7 @@ func (a agentService) Call(ctx context.Context, rc reqctx.Reqctxs, endpoints []*
 
 	// Return results from cache
 	if len(_jsonrpcs) <= 0 {
-		a.logger.Info().
+		a.logger.Debug().
 			Uint64("chain_id", chainId).
 			Str("app", appName).
 			Msg("All results from cache")
@@ -357,7 +294,7 @@ func (a agentService) Call(ctx context.Context, rc reqctx.Reqctxs, endpoints []*
 					"from_cache": cacheHits[i],
 				}
 				// Log each result
-				a.logger.Info().
+				a.logger.Debug().
 					Uint64("chain_id", chainId).
 					Str("app", appName).
 					Str("method", jsonrpcs[i].Method()).
@@ -368,7 +305,7 @@ func (a agentService) Call(ctx context.Context, rc reqctx.Reqctxs, endpoints []*
 			return json.Marshal(responseArray)
 		} else if len(results) > 0 {
 			// Log result
-			a.logger.Info().
+			a.logger.Debug().
 				Uint64("chain_id", chainId).
 				Str("app", appName).
 				Str("method", jsonrpcs[0].Method()).
@@ -406,7 +343,7 @@ func (a agentService) Call(ctx context.Context, rc reqctx.Reqctxs, endpoints []*
 					"from_cache": true,
 				}
 				// Log result from cache
-				a.logger.Info().
+				a.logger.Debug().
 					Uint64("chain_id", chainId).
 					Str("app", appName).
 					Str("method", jsonrpcs[i].Method()).
@@ -429,7 +366,7 @@ func (a agentService) Call(ctx context.Context, rc reqctx.Reqctxs, endpoints []*
 							"from_cache": false,
 						}
 						// Log result from request
-						a.logger.Info().
+						a.logger.Debug().
 							Uint64("chain_id", chainId).
 							Str("app", appName).
 							Str("method", jsonrpcs[index].Method()).
@@ -446,7 +383,7 @@ func (a agentService) Call(ctx context.Context, rc reqctx.Reqctxs, endpoints []*
 		// Add from_cache field
 		result["from_cache"] = false
 		// Log result
-		a.logger.Info().
+		a.logger.Debug().
 			Uint64("chain_id", chainId).
 			Str("app", appName).
 			Str("method", jsonrpcs[0].Method()).
@@ -466,12 +403,6 @@ func (a agentService) call(ctx context.Context, rc reqctx.Reqctxs, endpoints []*
 	if !ok || len(_endpoints) <= 0 {
 		a.logger.Error().Msgf("%d No available endpoints", chainId)
 		return nil, common.InternalServerError("No available endpoints")
-	}
-
-	// Get current block number for caching
-	currentBlock, err := a.getCurrentBlock(ctx, rc, _endpoints)
-	if err != nil {
-		a.logger.Warn().Err(err).Msg("Failed to get current block number")
 	}
 
 	// Form array of SealedJSONRPC for sending
@@ -520,7 +451,7 @@ func (a agentService) call(ctx context.Context, rc reqctx.Reqctxs, endpoints []*
 			method := jsonrpcs[i].Method()
 			if a.canCache(method) && results[i].Error == nil {
 				key := a.cacheKey(chainId, jsonrpcs[i])
-				if err := a.setCache(key, results[i].Result, method, currentBlock); err != nil {
+				if err := a.setCache(key, results[i].Result, method); err != nil {
 					a.logger.Warn().
 						Err(err).
 						Str("method", method).
@@ -549,123 +480,155 @@ func (a agentService) canCache(method string) bool {
 }
 
 // shouldInvalidateCache checks if the cache should be invalidated
-func (a agentService) shouldInvalidateCache(method string, entry *CacheEntry, currentBlock *string) bool {
+func (a agentService) shouldInvalidateCache(method string, entry *CacheEntry) bool {
 	if entry == nil || a.config.CacheMethods == nil {
+		a.logger.Debug().
+			Str("method", method).
+			Msg("Cache invalidated: entry or config is nil")
 		return true
 	}
 
 	config, ok := a.config.CacheMethods[method]
 	if !ok {
+		a.logger.Debug().
+			Str("method", method).
+			Msg("Cache invalidated: method not found in config")
 		return true
 	}
 
 	// Check TTL
-	if time.Since(time.Unix(entry.T, 0)) > config.TTL {
+	timeSince := time.Since(time.Unix(entry.T, 0))
+	if timeSince > config.TTL {
+		a.logger.Debug().
+			Str("method", method).
+			Dur("time_since", timeSince).
+			Dur("ttl", config.TTL).
+			Msg("Cache invalidated: TTL expired")
 		return true
 	}
 
-	// Check block number if needed
-	if config.InvalidateOnBlock && currentBlock != nil && entry.BlockNum != nil {
-		return *currentBlock != *entry.BlockNum
-	}
-
+	a.logger.Debug().
+		Str("method", method).
+		Msg("Cache is valid")
 	return false
 }
 
 // cacheKey generates a cache key
 func (a agentService) cacheKey(chainId uint64, jsonrpc rpc.JSONRPCer) string {
-	return fmt.Sprintf("%d:%s:%s", chainId, jsonrpc.Method(), helpers.Short(fmt.Sprint(jsonrpc.Raw())))
+	// Используем только params из Raw() для более точного ключа
+	params := jsonrpc.Raw()["params"]
+	paramsStr := ""
+	if params != nil {
+		if paramsBytes, err := json.Marshal(params); err == nil {
+			paramsStr = string(paramsBytes)
+		}
+	}
+	key := fmt.Sprintf("%d:%s:%s", chainId, jsonrpc.Method(), paramsStr)
+	a.logger.Debug().
+		Uint64("chain_id", chainId).
+		Str("method", jsonrpc.Method()).
+		Interface("params", params).
+		Str("cache_key", key).
+		Msg("Generated cache key")
+	return key
 }
 
 // getCache retrieves a value from cache
-func (a agentService) getCache(key string, method string, currentBlock *string) (interface{}, error) {
-	data, err := a.cache.Get(key)
-	if err == bigcache.ErrEntryNotFound {
+func (a agentService) getCache(key string, method string) (interface{}, error) {
+	ctx := context.Background()
+	data, err := a.redis.Client.Get(ctx, key).Bytes()
+	if err == redis.Nil {
+		a.logger.Debug().
+			Str("method", method).
+			Str("key", key).
+			Msg("Cache miss: key not found")
 		return nil, fmt.Errorf("cache entry not found")
 	}
 	if err != nil {
+		a.logger.Debug().
+			Str("method", method).
+			Str("key", key).
+			Err(err).
+			Msg("Cache error: failed to get value")
 		return nil, err
 	}
 
 	var entry CacheEntry
 	if err := json.Unmarshal(data, &entry); err != nil {
+		a.logger.Debug().
+			Str("method", method).
+			Str("key", key).
+			Err(err).
+			Msg("Cache error: failed to unmarshal entry")
 		return nil, err
 	}
 
 	// Check cache validity
-	if a.shouldInvalidateCache(method, &entry, currentBlock) {
+	if a.shouldInvalidateCache(method, &entry) {
+		a.logger.Debug().
+			Str("method", method).
+			Str("key", key).
+			Interface("entry", entry).
+			Msg("Cache invalidated")
 		return nil, nil
 	}
 
-	if entry.compressed {
-		if decompressed, err := helpers.Decompress(entry.V.([]byte)); err != nil {
-			return nil, err
-		} else {
-			var result interface{}
-			if err := json.Unmarshal(decompressed, &result); err != nil {
-				return nil, err
-			}
-			return result, nil
-		}
-	}
-
+	a.logger.Debug().
+		Str("method", method).
+		Str("key", key).
+		Interface("value", entry.V).
+		Time("cached_at", time.Unix(entry.T, 0)).
+		Msg("Cache hit")
 	return entry.V, nil
 }
 
 // setCache stores a value in cache
-func (a agentService) setCache(key string, value interface{}, method string, currentBlock *string) error {
+func (a agentService) setCache(key string, value interface{}, method string) error {
 	if !a.canCache(method) {
+		a.logger.Debug().
+			Str("method", method).
+			Str("key", key).
+			Msg("Method not cacheable")
 		return nil
 	}
 
 	entry := CacheEntry{
-		V:        value,
-		T:        time.Now().Unix(),
-		BlockNum: currentBlock,
-	}
-
-	// Check value size
-	jsonData, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-
-	// If size exceeds limit - compress
-	if len(jsonData) > a.config.MaxEntryCacheSize {
-		compressed, err := helpers.Compress(jsonData)
-		if err != nil {
-			return err
-		}
-		entry.V = compressed
-		entry.compressed = true
+		V: value,
+		T: time.Now().Unix(),
 	}
 
 	data, err := json.Marshal(entry)
 	if err != nil {
+		a.logger.Debug().
+			Str("method", method).
+			Str("key", key).
+			Err(err).
+			Msg("Cache error: failed to marshal entry")
 		return err
 	}
 
-	return a.cache.Set(key, data)
-}
+	ctx := context.Background()
+	ttl := a.config.CacheTTL
+	if methodConfig, ok := a.config.CacheMethods[method]; ok {
+		ttl = methodConfig.TTL
+	}
 
-// getCurrentBlock gets the current block number
-func (a agentService) getCurrentBlock(ctx context.Context, rc reqctx.Reqctxs, endpoints []*endpoint.Endpoint) (*string, error) {
-	blockNumberRPC := rpc.NewJSONRPC(map[string]any{
-		"method": "eth_blockNumber",
-		"params": []any{},
-		"id":     "block_number",
-	})
-	sealed := blockNumberRPC.Seal()
-
-	results, err := a.client.Request(ctx, rc, endpoints, []rpc.SealedJSONRPC{sealed})
+	err = a.redis.Client.Set(ctx, key, data, ttl).Err()
 	if err != nil {
-		return nil, err
+		a.logger.Debug().
+			Str("method", method).
+			Str("key", key).
+			Dur("ttl", ttl).
+			Err(err).
+			Msg("Cache error: failed to set value")
+		return err
 	}
 
-	if len(results) > 0 && results[0].Result() != nil {
-		blockNum := fmt.Sprint(results[0].Result())
-		return &blockNum, nil
-	}
-
-	return nil, nil
+	a.logger.Debug().
+		Str("method", method).
+		Str("key", key).
+		Interface("value", value).
+		Dur("ttl", ttl).
+		Msg("Value cached successfully")
+	return nil
 }

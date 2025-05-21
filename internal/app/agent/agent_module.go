@@ -20,20 +20,33 @@ var NewAgentModule = fx.Options(
 	fx.Provide(repository.NewTenantRepository),
 
 	// register service of agent module
-	fx.Provide(service.NewAgentService),
-	fx.Provide(service.NewTenantService),
 	fx.Provide(service.NewEndpointService),
+	fx.Provide(service.NewTenantService),
+	fx.Provide(service.NewAgentService),
 
 	// register controller of agent module
 	fx.Provide(controller.NewAgentController),
 	fx.Provide(controller.NewOtherController),
 
-	fx.Provide(core.NewClient),
+	// provide core dependencies
+	fx.Provide(core.NewClient), // Base client without annotation
+	fx.Provide(
+		fx.Annotate(
+			core.NewClient,
+			fx.ResultTags(`name:"client"`),
+		),
+	),
 
+	// Provide both annotated and non-annotated JSONRPCSchema
 	fx.Provide(NewJSONRPCSchema),
+	fx.Provide(
+		fx.Annotate(
+			NewJSONRPCSchema,
+			fx.ResultTags(`name:"jrpcSchema"`),
+		),
+	),
 
 	fx.Provide(NewClientFactory),
-
 	fx.Provide(NewWeb3RPCProvider),
 )
 
