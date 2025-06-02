@@ -174,12 +174,12 @@ func (e *Endpoint) String() string {
 func (e *Endpoint) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		ChainID uint64 `json:"chainId"`
-		Url		string `json:"url"`
-		Weight 	int `json:"weight"`
+		Url     string `json:"url"`
+		Weight  int    `json:"weight"`
 	}{
 		ChainID: e.ChainID(),
-		Url: e.Url().String(),
-		Weight: e.Weight(),
+		Url:     e.Url().String(),
+		Weight:  e.Weight(),
 	})
 }
 

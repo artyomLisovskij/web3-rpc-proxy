@@ -1,7 +1,7 @@
 package helpers
 
 // 合并多个数组，并对相同 ID 的对象进行合并操作
-func MergeSlicesBy[T comparable](iteratee func (a, b T) T, unique func (element T) string, arrays ...[]T) []T {
+func MergeSlicesBy[T comparable](iteratee func(a, b T) T, unique func(element T) string, arrays ...[]T) []T {
 	// 创建一个 map 来存储已处理的对象，ID 为键
 	exists := make(map[string]T)
 

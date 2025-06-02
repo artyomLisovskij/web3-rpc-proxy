@@ -9,8 +9,6 @@
 // Package service is a generated GoMock package.
 package service
 
-
-
 // func TestCall(t *testing.T)  {
 // 	ctrl := gomock.NewController(t)
 // 	defer ctrl.Finish()
@@ -40,7 +38,6 @@ package service
 // 	ctx.Request.SetHost("test")
 // 	// ctx.Response.Header.Set("Location", "test")
 // 	// ctx.Response.SetStatusCode(200)
-
 
 // 	// 正常
 // 	agentService.Call(ctx)

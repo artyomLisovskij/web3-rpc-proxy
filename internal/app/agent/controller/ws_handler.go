@@ -2,10 +2,12 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/DODOEX/web3rpcproxy/internal/common"
@@ -83,12 +85,56 @@ func (a *agentController) HandleWebSocket(ctx *fasthttp.RequestCtx) {
 			a.logger.Error().Msg("WebSocket connection is nil")
 			return
 		}
-		defer func() {
-			if err := conn.Close(); err != nil {
-				logWebSocket(fmt.Sprintf("❌ Error closing connection: %v", err))
-				a.logger.Error().Err(err).Msg("Error closing WebSocket connection")
+
+		// Create context for proper goroutine management
+		wsCtx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// Mutex to protect concurrent writes to WebSocket
+		var writeMutex sync.Mutex
+
+		// Connection state tracking
+		var connectionClosed bool
+		var closeMutex sync.RWMutex
+
+		// Helper function to safely write to WebSocket
+		safeWrite := func(messageType int, data []byte) error {
+			closeMutex.RLock()
+			if connectionClosed {
+				closeMutex.RUnlock()
+				return fmt.Errorf("connection is closed")
 			}
-		}()
+			closeMutex.RUnlock()
+
+			writeMutex.Lock()
+			defer writeMutex.Unlock()
+
+			// Double-check after acquiring write lock
+			closeMutex.RLock()
+			if connectionClosed {
+				closeMutex.RUnlock()
+				return fmt.Errorf("connection is closed")
+			}
+			closeMutex.RUnlock()
+
+			conn.SetWriteDeadline(time.Now().Add(writeWait))
+			return conn.WriteMessage(messageType, data)
+		}
+
+		// Helper function to safely close connection
+		safeClose := func() {
+			closeMutex.Lock()
+			if !connectionClosed {
+				connectionClosed = true
+				if err := conn.Close(); err != nil {
+					logWebSocket(fmt.Sprintf("❌ Error closing connection: %v", err))
+					a.logger.Error().Err(err).Msg("Error closing WebSocket connection")
+				}
+			}
+			closeMutex.Unlock()
+		}
+
+		defer safeClose()
 
 		logWebSocket("🔌 WebSocket connection established")
 
@@ -102,7 +148,8 @@ func (a *agentController) HandleWebSocket(ctx *fasthttp.RequestCtx) {
 		})
 
 		// Send welcome message
-		if err := conn.WriteJSON(map[string]string{"status": "connected"}); err != nil {
+		welcomeMsg, _ := json.Marshal(map[string]string{"status": "connected"})
+		if err := safeWrite(websocket.TextMessage, welcomeMsg); err != nil {
 			logWebSocket(fmt.Sprintf("❌ Error sending welcome message: %v", err))
 			a.logger.Error().Err(err).Msg("Failed to send welcome message")
 			return
@@ -112,20 +159,19 @@ func (a *agentController) HandleWebSocket(ctx *fasthttp.RequestCtx) {
 
 		a.logger.Debug().Msgf("New WebSocket connection established for chainId=%v", chainId)
 
-		// Start ping goroutine
-		done := make(chan struct{})
+		// Start ping goroutine with proper context management
 		go func() {
 			ticker := time.NewTicker(pingPeriod)
 			defer ticker.Stop()
 
 			for {
 				select {
-				case <-done:
+				case <-wsCtx.Done():
+					logWebSocket("📤 Ping goroutine stopped")
 					return
 				case <-ticker.C:
 					logWebSocket("📤 Sending PING")
-					conn.SetWriteDeadline(time.Now().Add(writeWait))
-					if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+					if err := safeWrite(websocket.PingMessage, nil); err != nil {
 						logWebSocket(fmt.Sprintf("❌ Error sending PING: %v", err))
 						a.logger.Error().Err(err).Msg("Error sending ping")
 						return
@@ -175,7 +221,10 @@ func (a *agentController) HandleWebSocket(ctx *fasthttp.RequestCtx) {
 					},
 				}
 				responseBytes, _ := json.Marshal(errorResponse)
-				conn.WriteMessage(websocket.TextMessage, responseBytes)
+				if err := safeWrite(websocket.TextMessage, responseBytes); err != nil {
+					logWebSocket(fmt.Sprintf("❌ Error sending error response: %v", err))
+					break
+				}
 				continue
 			}
 
@@ -238,7 +287,10 @@ func (a *agentController) HandleWebSocket(ctx *fasthttp.RequestCtx) {
 					},
 				}
 				responseBytes, _ := json.Marshal(errorResponse)
-				conn.WriteMessage(websocket.TextMessage, responseBytes)
+				if err := safeWrite(websocket.TextMessage, responseBytes); err != nil {
+					logWebSocket(fmt.Sprintf("❌ Error sending error response: %v", err))
+					break
+				}
 				continue
 			}
 
@@ -284,8 +336,7 @@ func (a *agentController) HandleWebSocket(ctx *fasthttp.RequestCtx) {
 			}
 
 			// Send response
-			conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := conn.WriteMessage(websocket.TextMessage, responseBytes); err != nil {
+			if err := safeWrite(websocket.TextMessage, responseBytes); err != nil {
 				logWebSocket(fmt.Sprintf("❌ Error sending response: %v", err))
 				break
 			}
